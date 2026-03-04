@@ -1,5 +1,6 @@
 import argparse
 import time
+import os
 
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from torch.autograd import Variable
@@ -21,6 +22,13 @@ parser.add_argument(
 )
 parser.add_argument("--test_data", type=str, default="./Spk2ImgNet_test2/test2/", help="test set")
 parser.add_argument(
+    "--test_data_format",
+    type=str,
+    default="auto",
+    choices=["auto", "dat", "zarr"],
+    help="test data source format",
+)
+parser.add_argument(
     "--save_result", type=bool, default=True, help="save the reconstruction or not"
 )
 parser.add_argument(
@@ -35,6 +43,45 @@ opt = parser.parse_args()
 
 def normalize(data):
     return data / 255.0
+
+
+def load_test_sources(test_data, test_data_format):
+    if test_data_format == "dat":
+        files_source = glob.glob(os.path.join(test_data, "input", "*.dat"))
+        files_source.sort()
+        return ["dat", files_source]
+
+    if test_data_format == "zarr":
+        return ["zarr", [test_data]]
+
+    files_source = glob.glob(os.path.join(test_data, "input", "*.dat"))
+    files_source.sort()
+    if len(files_source) > 0:
+        return ["dat", files_source]
+    return ["zarr", [test_data]]
+
+
+def load_spike_sequence(source_path, source_type):
+    if source_type == "dat":
+        with open(source_path, "rb") as input_f:
+            video_seq = input_f.read()
+        video_seq = np.fromstring(video_seq, "B")
+        return raw_to_spike(video_seq, 250, 400)
+
+    try:
+        import zarr
+    except ImportError as e:
+        raise ImportError(
+            "zarr is required for --test_data_format zarr. Please install it first."
+        ) from e
+
+    zarr_group = zarr.open_group(source_path, mode="r")
+    if "frames" not in zarr_group:
+        raise KeyError('Zarr group must contain an array named "frames"')
+    spike_array = np.asarray(zarr_group["frames"])
+    if spike_array.ndim != 3:
+        raise ValueError('Zarr array "frames" must be 3D with shape (T, H, W)')
+    return spike_array.astype(np.uint8)
 
 
 def main():
@@ -52,19 +99,22 @@ def main():
     # load data info
     print("Loading data info ...\n")
     # sub_dir = 'data4'
-    files_source = glob.glob(os.path.join(opt.test_data, "input", "*.dat"))
-    files_source.sort()
+    source_type, files_source = load_test_sources(opt.test_data, opt.test_data_format)
+    if len(files_source) == 0:
+        raise FileNotFoundError("No test samples found")
 
     # process data
     psnr_test = 0
     ssim_test = 0
     for i in range(len(files_source)):
-        sub_dir = files_source[i][:-4]
-        # Input spike
-        input_f = open(files_source[i], "rb+")
-        video_seq = input_f.read()
-        video_seq = np.fromstring(video_seq, "B")
-        InSpikeArray = raw_to_spike(video_seq, 250, 400)  # c*h*w
+        if source_type == "dat":
+            sub_dir = files_source[i][:-4]
+            file_name = files_source[i].replace("\\", "/").split("/")[-1]
+        else:
+            sub_dir = os.path.basename(files_source[i]).replace(".zarr", "")
+            file_name = sub_dir + ".zarr"
+
+        InSpikeArray = load_spike_sequence(files_source[i], source_type)  # c*h*w
         [c, h, w] = InSpikeArray.shape
         for key_id in np.arange(151, 152, 1):
             start_t = time.time()
@@ -74,7 +124,6 @@ def main():
                 SpikeArray, ((0, 0), (0, 2), (0, 0)), "symmetric"
             )  # c*252*40
             SpikeArray = np.expand_dims(SpikeArray, 0)  # n*c*h*w
-            file_name = files_source[i].replace("\\", "/").split("/")[-1]
 
             SpikeArray = Variable(torch.Tensor(SpikeArray)).cuda()
             with torch.no_grad():
